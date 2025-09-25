@@ -53,6 +53,9 @@ unsigned long menuTimeout = 0;
 #define MENU_TIMEOUT 5000  // 5 seconds
 #define BUTTON_HOLD_TIME 500  // 500ms to trigger menu
 
+// Maximum GIF size allowed (1.5 MB)
+#define MAX_GIF_SIZE_BYTES (1536UL * 1024UL)
+
 // Current loaded GIF
 String currentLoadedGif = "";
 String currentGifPath = ""; // Path to current GIF (SD or SPIFFS)
@@ -60,6 +63,9 @@ String currentGifPath = ""; // Path to current GIF (SD or SPIFFS)
 // GIF loading state
 bool pendingGifLoad = false;
 int pendingGifIndex = -1;
+
+// Track last serial-announced playing GIF to avoid spamming the serial port
+String lastPlayedSerial = "";
 
 // Function declarations
 void handleButtons();
@@ -390,7 +396,8 @@ void handleButtons() {
 void enterMenu() {
   Serial.println("Entering menu mode");
   inMenu = true;
-  menuSelection = currentGifIndex; // Start with current GIF selected
+  int totalItems = gifCount + 1; // include Clear GIF
+  menuSelection = min(currentGifIndex, totalItems - 1); // Start with current GIF selected but clamp
   menuTimeout = millis();
   drawMenu();
 }
@@ -462,70 +469,117 @@ void selectCurrentGif() {
 }
 
 void drawMenu() {
+  // Guard drawing with the SPI mutex to avoid concurrent SPI access causing partial frames
+  if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+  tft.startWrite();
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
   tft.setCursor(10, 5);
   tft.setTextSize(1);
-  tft.print("Select GIF (up/down=navigate, sel=choose):");
-  
+  tft.print("Select GIF:");
+
   int yPos = 25;
   int startIndex = 0;
-  int maxVisible = 7; // Show 7 files max (not counting Clear button)
-  
-  // Scroll if needed
+  int maxVisible = 7; // number of visible items including Clear GIF
+  int totalItems = gifCount + 1; // gifs + Clear GIF
+
+  // Compute startIndex so selected item is visible and acts like a scrolling list
   if (menuSelection >= maxVisible) {
     startIndex = menuSelection - maxVisible + 1;
   }
-  
-  for (int i = startIndex; i < gifCount && i < startIndex + maxVisible; i++) {
+  // Clamp startIndex so we don't go past the end
+  if (startIndex > (totalItems - maxVisible)) {
+    startIndex = max(0, totalItems - maxVisible);
+  }
+
+  int endIndex = min(totalItems, startIndex + maxVisible);
+
+  for (int i = startIndex; i < endIndex; i++) {
     tft.setCursor(10, yPos);
-    
-    // Highlight selected item
-    if (i == menuSelection) {
-      tft.setTextColor(TFT_BLACK, TFT_WHITE); // Inverted colors
-      tft.print("> ");
+
+    // Handle Clear GIF as the final item (i == gifCount)
+    if (i == gifCount) {
+      // Clear GIF entry
+      if (i == menuSelection) {
+        // Highlight with yellow background when selected
+        tft.fillRect(8, yPos - 2, tft.width() - 16, 13, TFT_YELLOW);
+        tft.setTextColor(TFT_BLACK);
+        tft.print("> Clear GIF");
+      } else {
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.print("  Clear GIF");
+      }
     } else {
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.print("  ");
+      // Regular GIF entry
+      // Highlight selected item with inverted colors
+      if (i == menuSelection) {
+        tft.setTextColor(TFT_BLACK, TFT_WHITE); // Inverted colors
+        tft.print("> ");
+      } else {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.print("  ");
+      }
+
+      // Remove path and extension for cleaner display
+      String displayName = gifFiles[i];
+      displayName.replace("/", "");
+      displayName.replace(".gif", "");
+      displayName.replace(".GIF", "");
+
+      tft.print(displayName);
+
+      // Show if this is currently loaded
+      if (i == currentGifIndex) {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.print(" (current)");
+      }
     }
-    
-    // Remove path and extension for cleaner display
-    String displayName = gifFiles[i];
-    displayName.replace("/", "");
-    displayName.replace(".gif", "");
-    displayName.replace(".GIF", "");
-    
-    tft.print(displayName);
-    
-    // Show if this is currently loaded
-    if (i == currentGifIndex) {
-      tft.setTextColor(TFT_GREEN, TFT_BLACK);
-      tft.print(" (current)");
-    }
-    
+
     yPos += 13;
   }
-  
-  // Show current selection info
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setCursor(10, 120);
-  int totalItems = gifCount + 1; // include Clear GIF
-  tft.printf("Selection: %d/%d | Auto-exit in 5s", menuSelection + 1, totalItems);
 
-  // Draw Clear GIF button below the list (use yPos so it follows the last item)
-  int clearY = yPos + 4;
-  // Cap to near bottom of screen to avoid drawing off-screen
-  if (clearY > (tft.height() - 20)) clearY = tft.height() - 20;
-  tft.setCursor(10, clearY);
-  if (menuSelection == gifCount) {
-    // Highlighted (selected)
-    tft.setTextColor(TFT_BLACK, TFT_YELLOW);
-    tft.fillRect(8, clearY - 2, 140, 18, TFT_YELLOW);
-    tft.print("Clear GIF");
-  } else {
+  // Show current selection info (bottom-left), exclude Clear GIF from counter (hide when Clear is selected)
+  if (menuSelection < gifCount) {
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.print("Clear GIF");
+    tft.setCursor(10, tft.height() - 12);
+    tft.printf("Selection: %d/%d", menuSelection + 1, gifCount);
   }
+
+  // Draw a thin 'pong'-like cursor on the right when needed (no visible track)
+  int scrollX = tft.width() - 10;
+  int scrollTop = 25;
+  // leave a bottom margin so scrollbar never overlaps selection text
+  int bottomMargin = 18;
+  int maxScrollHeight = (tft.height() - scrollTop - bottomMargin);
+  int scrollHeight = min(maxVisible * 13, maxScrollHeight);
+  if (scrollHeight < 20) scrollHeight = 20; // minimum area
+  if (totalItems > maxVisible) {
+    int cursorW = 4; // thin cursor
+    int thumbH = 6; // fixed short height
+
+    // compute slot height for visible items so the thumb moves in discrete steps per selection
+    float slotH = (float)scrollHeight / (float)maxVisible;
+    int indexInWindow = menuSelection - startIndex;
+    if (indexInWindow < 0) indexInWindow = 0;
+    if (indexInWindow >= maxVisible) indexInWindow = maxVisible - 1;
+    int thumbY = scrollTop + (int)(indexInWindow * slotH + (slotH - thumbH) / 2.0);
+
+    // Clamp to scroll area
+    if (thumbY < scrollTop) thumbY = scrollTop;
+    if (thumbY > (scrollTop + scrollHeight - thumbH)) thumbY = scrollTop + scrollHeight - thumbH;
+
+    // Draw only the thumb (no track) in white on top of everything
+    tft.fillRect(scrollX, thumbY, cursorW, thumbH, TFT_WHITE);
+  } else {
+    // when no scrolling needed, draw a short centered cursor for visual hint
+    int cursorW = 4;
+    int thumbH = 6;
+    int thumbY = scrollTop + (scrollHeight - thumbH) / 2;
+    tft.fillRect(scrollX, thumbY, cursorW, thumbH, TFT_WHITE);
+  }
+  tft.endWrite();
+  if (spiMutex) xSemaphoreGive(spiMutex);
+  
 }
 
 void playCurrentGif() {
@@ -569,13 +623,15 @@ void playCurrentGif() {
   gif.begin(BIG_ENDIAN_PIXELS);
   yield();
   
-  Serial.printf("Playing from SPIFFS: %s\n", currentGifPath.c_str());
+  // Only announce playing GIF when it changes (or first time)
+  if (lastPlayedSerial != currentLoadedGif) {
+    lastPlayedSerial = currentLoadedGif;
+    Serial.printf("Playing: %s\n", currentLoadedGif.c_str());
+  }
   // Ensure any TFT DMA is complete before opening file
   tft.dmaWait();
-  Serial.println("About to open SPIFFS file...");
-  delay(100);
+  delay(20);
   gifOpened = gif.open(currentGifPath.c_str(), fileOpen, fileClose, fileRead, fileSeek, GIFDraw);
-  Serial.println("After open SPIFFS call");
 
   if (currentLoadedGif != "" && gifOpened)
   {
@@ -611,10 +667,15 @@ void scanAllGifs() {
     
     String fileName = entry.name();
     if (fileName.endsWith(".gif") || fileName.endsWith(".GIF")) {
-      if (gifCount < 20) { // Prevent array overflow
-        gifFiles[gifCount] = fileName; // Store just the filename, not full path
-        Serial.printf("Found GIF: %s (%d bytes)\n", fileName.c_str(), entry.size());
-        gifCount++;
+      size_t fsize = entry.size();
+      if (fsize > MAX_GIF_SIZE_BYTES) {
+        Serial.printf("Skipping large GIF (>%u bytes): %s\n", (unsigned)MAX_GIF_SIZE_BYTES, fileName.c_str());
+      } else {
+        if (gifCount < 20) { // Prevent array overflow
+          gifFiles[gifCount] = fileName; // Store just the filename, not full path
+          Serial.printf("Found GIF: %s (%u bytes)\n", fileName.c_str(), (unsigned)fsize);
+          gifCount++;
+        }
       }
     }
     entry.close();
@@ -678,11 +739,24 @@ int32_t fileSeek(GIFFILE *pFile, int32_t iPosition)
 
 // Function to copy a file from SD to SPIFFS with progress
 bool copyFile(const char *srcPath, const char *dstPath) {
-  tft.fillScreen(TFT_BLACK);
+  // Clear a slightly larger area to avoid residual edge pixels from previous screens
+  tft.fillRect(6, 36, tft.width() - 12, 64, TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
-  tft.setCursor(10, 40);
-  tft.print("Copying to SPIFFS...");
-  tft.drawRect(10, 60, 220, 20, TFT_WHITE);
+  tft.setCursor(12, 44);
+  tft.print("Copying to flash...");
+  // blank line for separation
+  tft.setCursor(12, 54);
+  tft.print(" ");
+  // Draw a centered progress bar (leave 6px margin left/right)
+  int barX = 12;
+  int barY = 64;
+  int barW = tft.width() - 24; // safe width
+  int barH = 18;
+  if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+  tft.startWrite();
+  tft.drawRect(barX - 1, barY - 1, barW + 2, barH + 2, TFT_WHITE);
+  tft.endWrite();
+  if (spiMutex) xSemaphoreGive(spiMutex);
 
   File srcFile = SD.open(srcPath);
   if (!srcFile) {
@@ -690,14 +764,19 @@ bool copyFile(const char *srcPath, const char *dstPath) {
     return false;
   }
 
+  // Check the file size before copying
+  size_t fileSize = srcFile.size();
+  if (fileSize > MAX_GIF_SIZE_BYTES) {
+    Serial.printf("Source GIF too large (%u bytes) - max allowed is %u bytes\n", (unsigned)fileSize, (unsigned)MAX_GIF_SIZE_BYTES);
+    srcFile.close();
+    return false;
+  }
   File dstFile = SPIFFS.open(dstPath, FILE_WRITE);
   if (!dstFile) {
     Serial.println("Failed to open destination file for writing");
     srcFile.close();
     return false;
   }
-
-  size_t fileSize = srcFile.size();
   size_t bufferSize = 512;
   uint8_t buffer[bufferSize];
   size_t bytesCopied = 0;
@@ -708,11 +787,22 @@ bool copyFile(const char *srcPath, const char *dstPath) {
       dstFile.write(buffer, bytesRead);
       bytesCopied += bytesRead;
 
-      // Update progress bar
+      // Update progress bar, clamp to barW
       int progress = (int)(((float)bytesCopied / fileSize) * 100);
-      int barWidth = (progress * 218) / 100;
-      tft.fillRect(11, 61, barWidth, 18, TFT_GREEN);
-      
+      if (progress > 100) progress = 100;
+      int fillW = (progress * barW) / 100;
+      if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+      tft.startWrite();
+      if (fillW > 0) {
+        tft.fillRect(barX, barY, fillW, barH, TFT_GREEN);
+      }
+      // Small percentage text under the bar (invert background for readability)
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(barX + barW - 40, barY + barH + 4);
+      tft.printf("%3d%%", progress);
+      tft.endWrite();
+      if (spiMutex) xSemaphoreGive(spiMutex);
+
       yield(); // Allow other tasks to run
     } else {
       break;
