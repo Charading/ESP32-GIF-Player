@@ -2,7 +2,7 @@
 
 Small ESP32 sketch to browse GIFs on an SD card, copy a selected GIF into SPIFFS as `/current.gif`, and play it on a ST7735 TFT display.
 
-![alt text](images/video.mp4)
+![alt text](images/1.jpg)
 
 ## Features
 - Browse GIFs stored on SD card (up to 20 entries).
