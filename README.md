@@ -13,7 +13,7 @@ Small ESP32 sketch to browse GIFs on an SD card, copy a selected GIF into SPIFFS
 - Plays GIFs from SPIFFS only (prevents playing directly from SD) *I had so many issues trying to get that to work.*
 
 
-![alt text](images/1.jpg) 
+![alt text](images/demo.gif) 
 
 ## Pin assignments
 These are the pins used in `esp32_tft_sd_menu.ino`:
