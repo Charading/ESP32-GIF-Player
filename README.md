@@ -6,7 +6,8 @@ Small ESP32 sketch to browse GIFs on an SD card, copy a selected GIF into SPIFFS
 
 ## Features
 - Browse GIFs stored on SD card (up to 20 entries).
-- Menu UI on the TFT (navigate with buttons for now. *QMK serial commands soon to be implemented*).
+- Menu UI on the TFT (navigate with buttons for now. 
+- Menu can be controlled via UART commands `MENU_OPEN`, `MENU_UP`,`MENU_DOWN`,`MENU_SELECT`. *These have been mapped to special keycodes in a custom qmk and via firmware i've been working on, AND IT WORKS!*
 - Copy selected GIF from SD card to SPIFFS atomically (writes a temp file then renames).
 - Visual progress bar while copying. (*need to adjust positions and scaling*)
 - `Clear GIF` menu option removes `/current.gif` from SPIFFS.
