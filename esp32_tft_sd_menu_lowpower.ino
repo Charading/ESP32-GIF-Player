@@ -60,6 +60,28 @@ unsigned long menuTimeout = 0;
 #define MENU_TIMEOUT 5000  // 5 seconds
 #define BUTTON_HOLD_TIME 500  // 500ms to trigger menu
 
+// Settings menu system
+enum MenuType { MENU_GIF, MENU_SETTINGS, MENU_TIMER, MENU_STOPWATCH };
+MenuType currentMenuType = MENU_GIF;
+int settingsSelection = 0;
+
+// Settings toggles (persistent across menu opens)
+bool setting_socd_enabled = false;
+bool setting_raw_keycodes_enabled = false;
+bool setting_keypress_detection_enabled = false;
+bool setting_adc_printing_enabled = false;
+
+// Timer state
+int timerMinutes = 5; // default 5 minutes
+bool timerRunning = false;
+unsigned long timerEndTime = 0;
+unsigned long timerStartTime = 0;
+
+// Stopwatch state (for future implementation)
+bool stopwatchRunning = false;
+unsigned long stopwatchStartTime = 0;
+unsigned long stopwatchElapsed = 0;
+
 // Maximum GIF size allowed (1.5 MB)
 #define MAX_GIF_SIZE_BYTES (1536UL * 1024UL)
 
@@ -169,6 +191,13 @@ void enterMenu();
 void exitMenu();
 void selectCurrentGif();
 void drawMenu();
+void enterSettingsMenu();
+void drawSettingsMenu();
+void handleSettingsSelection();
+void enterTimerMenu();
+void drawTimerMenu();
+void handleTimerSelection();
+void updateTimer();
 void playCurrentGif();
 void scanAllGifs();
 void *fileOpen(const char *filename, int32_t *pFileSize);
@@ -362,10 +391,17 @@ void loop()
   handleButtons();
   handleQMKCommands();
   
+  // Update timer if running
+  if (timerRunning) {
+    updateTimer();
+  }
+  
   if (inMenu) {
-    // Menu mode - handle timeout
-    if (millis() - menuTimeout > MENU_TIMEOUT) {
-      exitMenu();
+    // Menu mode - handle timeout (except for timer/stopwatch menus)
+    if (currentMenuType == MENU_GIF || currentMenuType == MENU_SETTINGS) {
+      if (millis() - menuTimeout > MENU_TIMEOUT) {
+        exitMenu();
+      }
     }
   } else {
     // GIF playback mode - no more pending loads, direct SD card playback
@@ -672,33 +708,83 @@ void handleQMKCommands() {
     }
     else if (command == "MENU_UP") {
       if (inMenu) {
-        int total = gifCount + 1; // include Clear GIF
-        menuSelection = (menuSelection - 1 + total) % total;
-        Serial.printf("QMK UP - selection: %d\n", menuSelection);
-        menuTimeout = millis(); // Reset timeout
-        drawMenu();
-        QMKSerial.printf("MENU_POS:%d\n", menuSelection);
+        if (currentMenuType == MENU_GIF) {
+          int total = gifCount + 1; // include Clear GIF
+          menuSelection = (menuSelection - 1 + total) % total;
+          Serial.printf("QMK UP - selection: %d\n", menuSelection);
+          menuTimeout = millis(); // Reset timeout
+          drawMenu();
+          QMKSerial.printf("MENU_POS:%d\n", menuSelection);
+        } else if (currentMenuType == MENU_SETTINGS) {
+          // 0=Back, 1=SOCD, 2=Debugging(skip), 3=Raw Keycodes, 4=Keypress, 5=ADC
+          do {
+            settingsSelection--;
+            if (settingsSelection < 0) settingsSelection = 5;
+          } while (settingsSelection == 2); // Skip "Debugging" header
+          menuTimeout = millis();
+          drawSettingsMenu();
+          QMKSerial.printf("SETTINGS_POS:%d\n", settingsSelection);
+        } else if (currentMenuType == MENU_TIMER) {
+          if (!timerRunning) {
+            // Decrease time
+            timerMinutes = max(1, timerMinutes - 1);
+            drawTimerMenu();
+          } else {
+            // Reset if running
+            handleTimerSelection();
+          }
+          QMKSerial.println("TIMER_UP");
+        }
       } else {
         QMKSerial.println("MENU_NOT_OPEN");
       }
     }
     else if (command == "MENU_DOWN") {
       if (inMenu) {
-        int total = gifCount + 1; // include Clear GIF
-        menuSelection = (menuSelection + 1) % total;
-        Serial.printf("QMK DOWN - selection: %d\n", menuSelection);
-        menuTimeout = millis(); // Reset timeout
-        drawMenu();
-        QMKSerial.printf("MENU_POS:%d\n", menuSelection);
+        if (currentMenuType == MENU_GIF) {
+          int total = gifCount + 1; // include Clear GIF
+          menuSelection = (menuSelection + 1) % total;
+          Serial.printf("QMK DOWN - selection: %d\n", menuSelection);
+          menuTimeout = millis(); // Reset timeout
+          drawMenu();
+          QMKSerial.printf("MENU_POS:%d\n", menuSelection);
+        } else if (currentMenuType == MENU_SETTINGS) {
+          // 0=Back, 1=SOCD, 2=Debugging(skip), 3=Raw Keycodes, 4=Keypress, 5=ADC
+          do {
+            settingsSelection++;
+            if (settingsSelection > 5) settingsSelection = 0;
+          } while (settingsSelection == 2); // Skip "Debugging" header
+          menuTimeout = millis();
+          drawSettingsMenu();
+          QMKSerial.printf("SETTINGS_POS:%d\n", settingsSelection);
+        } else if (currentMenuType == MENU_TIMER) {
+          if (!timerRunning) {
+            // Increase time
+            timerMinutes = min(99, timerMinutes + 1);
+            drawTimerMenu();
+          } else {
+            // Reset if running
+            handleTimerSelection();
+          }
+          QMKSerial.println("TIMER_DOWN");
+        }
       } else {
         QMKSerial.println("MENU_NOT_OPEN");
       }
     }
     else if (command == "MENU_SELECT") {
       if (inMenu) {
-        Serial.printf("QMK SELECT - choosing GIF %d\n", menuSelection);
-        selectCurrentGif();
-        QMKSerial.printf("GIF_SELECTED:%s\n", gifFiles[currentGifIndex].c_str());
+        if (currentMenuType == MENU_GIF) {
+          Serial.printf("QMK SELECT - choosing GIF %d\n", menuSelection);
+          selectCurrentGif();
+          QMKSerial.printf("GIF_SELECTED:%s\n", gifFiles[currentGifIndex].c_str());
+        } else if (currentMenuType == MENU_SETTINGS) {
+          handleSettingsSelection();
+          QMKSerial.println("SETTINGS_TOGGLED");
+        } else if (currentMenuType == MENU_TIMER) {
+          handleTimerSelection(); // SELECT in timer = start/pause
+          QMKSerial.println("TIMER_SELECT");
+        }
       } else {
         QMKSerial.println("MENU_NOT_OPEN");
       }
@@ -710,6 +796,35 @@ void handleQMKCommands() {
                        gifFiles[currentGifIndex].c_str(),
                        menuSelection,
                        gifCount);
+    }
+    else if (command == "SETTINGS_OPEN") {
+      enterSettingsMenu();
+      QMKSerial.println("SETTINGS_OPENED");
+    }
+    else if (command == "TIMER_OPEN") {
+      enterTimerMenu();
+      QMKSerial.println("TIMER_OPENED");
+    }
+    else if (command == "MENU_CYCLE_RIGHT") {
+      if (inMenu && (currentMenuType == MENU_TIMER || currentMenuType == MENU_STOPWATCH)) {
+        // Cycle to stopwatch (future: add more menu types)
+        if (currentMenuType == MENU_TIMER) {
+          currentMenuType = MENU_STOPWATCH;
+          // drawStopwatchMenu(); // TODO: implement stopwatch
+          Serial.println("Cycled to stopwatch menu (not yet implemented)");
+        }
+      }
+      QMKSerial.println("MENU_CYCLED_RIGHT");
+    }
+    else if (command == "MENU_CYCLE_LEFT") {
+      if (inMenu && (currentMenuType == MENU_TIMER || currentMenuType == MENU_STOPWATCH)) {
+        // Cycle to timer
+        if (currentMenuType == MENU_STOPWATCH) {
+          currentMenuType = MENU_TIMER;
+          drawTimerMenu();
+        }
+      }
+      QMKSerial.println("MENU_CYCLED_LEFT");
     }
     else {
       QMKSerial.println("UNKNOWN_COMMAND");
@@ -788,8 +903,9 @@ void handleButtons() {
 }
 
 void enterMenu() {
-  Serial.println("Entering menu mode");
+  Serial.println("Entering GIF menu mode");
   inMenu = true;
+  currentMenuType = MENU_GIF;
   int totalItems = gifCount + 1; // include Clear GIF
   menuSelection = min(currentGifIndex, totalItems - 1); // Start with current GIF selected but clamp
   menuTimeout = millis();
@@ -799,6 +915,7 @@ void enterMenu() {
 void exitMenu() {
   Serial.println("Exiting menu mode");
   inMenu = false;
+  currentMenuType = MENU_GIF; // Reset to default
   tft.fillScreen(TFT_BLACK);
 }
 
@@ -974,6 +1091,245 @@ void drawMenu() {
   tft.endWrite();
   if (spiMutex) xSemaphoreGive(spiMutex);
   
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SETTINGS MENU
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void enterSettingsMenu() {
+  Serial.println("Entering settings menu");
+  inMenu = true;
+  currentMenuType = MENU_SETTINGS;
+  settingsSelection = 0;
+  menuTimeout = millis();
+  drawSettingsMenu();
+}
+
+void drawSettingsMenu() {
+  if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(10, 5);
+  tft.setTextSize(1);
+  tft.print("Settings:");
+
+  int yPos = 25;
+  const int lineHeight = 15;
+  
+  // Menu items
+  String items[] = {
+    "< Back",
+    "SOCD: " + String(setting_socd_enabled ? "ON" : "OFF"),
+    "Debugging",
+    "  Raw Keycodes: " + String(setting_raw_keycodes_enabled ? "ON" : "OFF"),
+    "  Keypress Detect: " + String(setting_keypress_detection_enabled ? "ON" : "OFF"),
+    "  ADC Printing: " + String(setting_adc_printing_enabled ? "ON" : "OFF")
+  };
+  
+  int itemCount = 6;
+  
+  for (int i = 0; i < itemCount; i++) {
+    tft.setCursor(10, yPos);
+    
+    // Highlight selected item
+    if (i == settingsSelection) {
+      tft.setTextColor(TFT_BLACK, TFT_WHITE);
+      tft.print("> ");
+    } else {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.print("  ");
+    }
+    
+    // Draw item text
+    String itemText = items[i];
+    
+    // Color ON/OFF text
+    if (itemText.indexOf("ON") > 0) {
+      int onPos = itemText.indexOf("ON");
+      String prefix = itemText.substring(0, onPos);
+      tft.print(prefix);
+      uint16_t prevColor = tft.textcolor;
+      tft.setTextColor(TFT_GREEN, i == settingsSelection ? TFT_WHITE : TFT_BLACK);
+      tft.print("ON");
+      tft.setTextColor(prevColor, i == settingsSelection ? TFT_WHITE : TFT_BLACK);
+    } else if (itemText.indexOf("OFF") > 0) {
+      int offPos = itemText.indexOf("OFF");
+      String prefix = itemText.substring(0, offPos);
+      tft.print(prefix);
+      uint16_t prevColor = tft.textcolor;
+      tft.setTextColor(TFT_RED, i == settingsSelection ? TFT_WHITE : TFT_BLACK);
+      tft.print("OFF");
+      tft.setTextColor(prevColor, i == settingsSelection ? TFT_WHITE : TFT_BLACK);
+    } else {
+      tft.print(itemText);
+    }
+    
+    yPos += lineHeight;
+  }
+  
+  tft.endWrite();
+  if (spiMutex) xSemaphoreGive(spiMutex);
+}
+
+void handleSettingsSelection() {
+  if (settingsSelection == 0) {
+    // Back button
+    exitMenu();
+  } else if (settingsSelection == 1) {
+    // Toggle SOCD
+    setting_socd_enabled = !setting_socd_enabled;
+    drawSettingsMenu();
+  } else if (settingsSelection == 3) {
+    // Toggle Raw Keycodes
+    setting_raw_keycodes_enabled = !setting_raw_keycodes_enabled;
+    drawSettingsMenu();
+  } else if (settingsSelection == 4) {
+    // Toggle Keypress Detection
+    setting_keypress_detection_enabled = !setting_keypress_detection_enabled;
+    drawSettingsMenu();
+  } else if (settingsSelection == 5) {
+    // Toggle ADC Printing
+    setting_adc_printing_enabled = !setting_adc_printing_enabled;
+    drawSettingsMenu();
+  }
+  // Item 2 is "Debugging" subheading, non-selectable (no action)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIMER MENU
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void enterTimerMenu() {
+  Serial.println("Entering timer menu");
+  inMenu = true;
+  currentMenuType = MENU_TIMER;
+  drawTimerMenu();
+}
+
+void drawTimerMenu() {
+  if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+  tft.startWrite();
+  tft.fillScreen(TFT_BLACK);
+  
+  // Draw timer title
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(10, 5);
+  tft.print("Timer");
+  
+  // Calculate remaining time
+  int displayMinutes = timerMinutes;
+  int displaySeconds = 0;
+  
+  if (timerRunning) {
+    unsigned long remaining = (timerEndTime > millis()) ? (timerEndTime - millis()) : 0;
+    displayMinutes = remaining / 60000;
+    displaySeconds = (remaining % 60000) / 1000;
+  }
+  
+  // Draw big timer numbers in center
+  tft.setTextSize(4);
+  char timeStr[10];
+  sprintf(timeStr, "%02d:%02d", displayMinutes, displaySeconds);
+  
+  // Estimate text width (each char is ~24px at size 4, with 6x8 base font)
+  int w = strlen(timeStr) * 24;
+  int h = 32; // Approximate height at size 4
+  int centerX = (tft.width() - w) / 2;
+  int centerY = (tft.height() - h) / 2;
+  
+  tft.setCursor(centerX, centerY);
+  tft.setTextColor(TFT_WHITE);
+  tft.print(timeStr);
+  
+  // Draw small orange arrows above and below (only when not running)
+  if (!timerRunning) {
+    int arrowX = tft.width() / 2;
+    // Up arrow
+    tft.fillTriangle(arrowX, centerY - 25, arrowX - 8, centerY - 15, arrowX + 8, centerY - 15, TFT_ORANGE);
+    // Down arrow
+    tft.fillTriangle(arrowX, centerY + h + 25, arrowX - 8, centerY + h + 15, arrowX + 8, centerY + h + 15, TFT_ORANGE);
+  }
+  
+  // Draw status
+  tft.setTextSize(1);
+  tft.setCursor(10, tft.height() - 15);
+  if (timerRunning) {
+    tft.setTextColor(TFT_GREEN);
+    tft.print("Running... SELECT=Pause");
+  } else {
+    tft.setTextColor(TFT_YELLOW);
+    tft.print("UP/DOWN=Adjust  SELECT=Start");
+  }
+  
+  tft.endWrite();
+  if (spiMutex) xSemaphoreGive(spiMutex);
+}
+
+void handleTimerSelection() {
+  if (timerRunning) {
+    // Any button press while running = reset timer
+    timerRunning = false;
+    Serial.println("Timer stopped/reset");
+    drawTimerMenu();
+  } else {
+    // Not running - check what was pressed
+    // UP/DOWN from UART commands increase/decrease minutes
+    // We'll handle this in the actual MENU_UP/DOWN handlers
+    // SELECT starts the timer
+    timerRunning = true;
+    timerStartTime = millis();
+    timerEndTime = millis() + (timerMinutes * 60000UL);
+    Serial.printf("Timer started for %d minutes\n", timerMinutes);
+    drawTimerMenu();
+  }
+}
+
+void updateTimer() {
+  if (!timerRunning) return;
+  
+  static unsigned long lastUpdate = 0;
+  unsigned long now = millis();
+  
+  // Update display every 100ms
+  if (now - lastUpdate > 100) {
+    lastUpdate = now;
+    
+    if (now >= timerEndTime) {
+      // Timer expired!
+      timerRunning = false;
+      Serial.println("Timer expired!");
+      
+      // Screen inversion effect (flash 3 times)
+      for (int i = 0; i < 3; i++) {
+        if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+        tft.startWrite();
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextSize(4);
+        tft.setTextColor(TFT_BLACK);
+        tft.setCursor(tft.width() / 2 - 80, tft.height() / 2 - 20);
+        tft.print("TIME'S UP!");
+        tft.endWrite();
+        if (spiMutex) xSemaphoreGive(spiMutex);
+        delay(200);
+        
+        if (spiMutex) xSemaphoreTake(spiMutex, portMAX_DELAY);
+        tft.startWrite();
+        tft.fillScreen(TFT_BLACK);
+        tft.endWrite();
+        if (spiMutex) xSemaphoreGive(spiMutex);
+        delay(200);
+      }
+      
+      // Return to timer display
+      drawTimerMenu();
+    } else {
+      // Redraw with updated time
+      drawTimerMenu();
+    }
+  }
 }
 
 void playCurrentGif() {
